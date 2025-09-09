@@ -1,23 +1,19 @@
-#!/usr/bin/env python3
-
-import json
+import streamlit as st
 import sqlite3
+import json
 import uuid
-import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
-from contextlib import contextmanager, asynccontextmanager
-import time
+from contextlib import contextmanager
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import random
-from collections import defaultdict
-
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status, Query, Path as PathParam
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, validator
-import uvicorn
 
 # Configuration
 DB_FILE = "gpu_cluster.db"
@@ -26,10 +22,7 @@ CLEANUP_INTERVAL_SECONDS = 30
 METRICS_RETENTION_DAYS = 7
 
 # Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -52,105 +45,23 @@ class JobState(str, Enum):
     CANCELLED = "cancelled"
 
 class SchedulingStrategy(str, Enum):
-    BEST_FIT = "best_fit"          # Minimize wasted resources
-    FIRST_FIT = "first_fit"        # Fastest allocation
-    LOAD_BALANCED = "load_balanced" # Distribute evenly
-    POWER_EFFICIENT = "power_efficient" # Minimize power usage
-    AFFINITY = "affinity"          # Keep jobs from same user together
-
-# ==============================================================================
-# Data Models
-# ==============================================================================
-
-class GPUCapabilities(BaseModel):
-    compute_capability: Optional[str] = ""
-    cuda_cores: Optional[int] = 0
-    tensor_cores: Optional[int] = 0
-    memory_bandwidth_gb: Optional[float] = 0.0
-    pcie_gen: Optional[int] = 3
-    supports_nvlink: Optional[bool] = False
-    supports_mig: Optional[bool] = False  # Multi-Instance GPU
-
-class RegisterGPURequest(BaseModel):
-    node_id: str = Field(..., min_length=1, max_length=64)
-    hostname: str
-    gpu_name: str
-    gpu_uuid: Optional[str] = ""
-    vendor: str = "NVIDIA"
-    memory_total_mb: int = Field(..., ge=1024)
-    driver_version: str
-    capabilities: Optional[GPUCapabilities] = None
-    tags: List[str] = []
-    location: Optional[str] = ""  # rack/datacenter location
-    
-    @validator('node_id')
-    def validate_node_id(cls, v):
-        if not v.replace('-', '').replace('_', '').isalnum():
-            raise ValueError('node_id must be alphanumeric with hyphens/underscores only')
-        return v
-
-class UpdateGPUMetricsRequest(BaseModel):
-    temperature_celsius: Optional[float] = None
-    utilization_percent: Optional[float] = None
-    memory_used_mb: Optional[int] = None
-    power_watts: Optional[float] = None
-    fan_speed_percent: Optional[int] = None
-    clock_speed_mhz: Optional[int] = None
-    memory_clock_mhz: Optional[int] = None
-    pcie_throughput_mb: Optional[float] = None
-    ecc_errors: Optional[int] = None
-
-class JobRequest(BaseModel):
-    job_name: str
-    user_id: str
-    priority: int = Field(default=5, ge=1, le=10)
-    requested_gpus: int = Field(default=1, ge=1)
-    memory_per_gpu_mb: int = Field(..., ge=1)
-    expected_duration_minutes: Optional[int] = None
-    scheduling_strategy: SchedulingStrategy = SchedulingStrategy.BEST_FIT
-    gpu_type_preference: Optional[str] = None
-    require_nvlink: bool = False
-    tags: List[str] = []
-    metadata: Dict[str, Any] = {}
-
-class JobResponse(BaseModel):
-    job_id: str
-    state: JobState
-    assigned_gpus: List[int]
-    scheduled_at: Optional[str] = None
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
-    message: str = ""
-
-class ClusterMetrics(BaseModel):
-    timestamp: str
-    total_gpus: int
-    available_gpus: int
-    busy_gpus: int
-    offline_gpus: int
-    total_memory_mb: int
-    used_memory_mb: int
-    average_utilization: float
-    average_temperature: float
-    total_power_watts: float
-    active_jobs: int
-    pending_jobs: int
-    jobs_per_hour: float
+    BEST_FIT = "best_fit"
+    FIRST_FIT = "first_fit"
+    LOAD_BALANCED = "load_balanced"
+    POWER_EFFICIENT = "power_efficient"
+    AFFINITY = "affinity"
 
 # ==============================================================================
 # Database Management
 # ==============================================================================
 
 class DatabaseManager:
-    """Handles all database operations with connection pooling"""
-    
     def __init__(self, db_file: str):
         self.db_file = db_file
         self.init_database()
     
     @contextmanager
     def get_connection(self):
-        """Get a database connection with automatic cleanup"""
         conn = sqlite3.connect(self.db_file, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -160,9 +71,8 @@ class DatabaseManager:
             conn.close()
     
     def init_database(self):
-        """Initialize all database tables"""
         with self.get_connection() as conn:
-            # GPUs table with comprehensive tracking
+            # GPUs table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS gpus (
                     gpu_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,26 +87,20 @@ class DatabaseManager:
                     memory_used_mb INTEGER DEFAULT 0,
                     driver_version TEXT,
                     
-                    -- Real-time metrics
                     temperature_celsius REAL DEFAULT 0,
                     utilization_percent REAL DEFAULT 0,
                     power_watts REAL DEFAULT 0,
                     fan_speed_percent INTEGER DEFAULT 0,
                     clock_speed_mhz INTEGER DEFAULT 0,
                     memory_clock_mhz INTEGER DEFAULT 0,
-                    pcie_throughput_mb REAL DEFAULT 0,
-                    ecc_errors INTEGER DEFAULT 0,
                     
-                    -- Capabilities
                     compute_capability TEXT,
                     cuda_cores INTEGER DEFAULT 0,
                     tensor_cores INTEGER DEFAULT 0,
                     memory_bandwidth_gb REAL DEFAULT 0,
-                    pcie_gen INTEGER DEFAULT 3,
                     supports_nvlink BOOLEAN DEFAULT 0,
                     supports_mig BOOLEAN DEFAULT 0,
                     
-                    -- Metadata
                     location TEXT,
                     tags TEXT DEFAULT '[]',
                     registered_at TEXT NOT NULL,
@@ -238,7 +142,7 @@ class DatabaseManager:
                 )
             """)
             
-            # Job-GPU assignments
+            # Job assignments
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS job_assignments (
                     assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,7 +172,7 @@ class DatabaseManager:
                 )
             """)
             
-            # Cluster events log
+            # Cluster events
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cluster_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,1095 +185,903 @@ class DatabaseManager:
                 )
             """)
             
-            # Create indices for performance
+            # Create indices
             conn.execute("CREATE INDEX IF NOT EXISTS idx_gpus_state ON gpus(state)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_gpus_heartbeat ON gpus(last_heartbeat)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_assignments_job ON job_assignments(job_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_assignments_gpu ON job_assignments(gpu_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON gpu_metrics_history(timestamp)")
             
             conn.commit()
-            logger.info("Database initialized successfully")
 
 # ==============================================================================
 # GPU Scheduler
 # ==============================================================================
 
 class GPUScheduler:
-    """Advanced GPU scheduling with multiple strategies"""
-    
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
     
-    def schedule_job(self, job_request: JobRequest) -> Optional[List[int]]:
-        """Schedule a job using the specified strategy"""
+    def schedule_job(self, job_request: dict) -> Optional[List[int]]:
         with self.db.get_connection() as conn:
-            # Get available GPUs
             available_gpus = self._get_available_gpus(conn, job_request)
             
-            if len(available_gpus) < job_request.requested_gpus:
+            if len(available_gpus) < job_request['requested_gpus']:
                 return None
             
-            # Apply scheduling strategy
-            if job_request.scheduling_strategy == SchedulingStrategy.BEST_FIT:
-                selected = self._best_fit_scheduling(available_gpus, job_request)
-            elif job_request.scheduling_strategy == SchedulingStrategy.FIRST_FIT:
-                selected = self._first_fit_scheduling(available_gpus, job_request)
-            elif job_request.scheduling_strategy == SchedulingStrategy.LOAD_BALANCED:
-                selected = self._load_balanced_scheduling(available_gpus, job_request)
-            elif job_request.scheduling_strategy == SchedulingStrategy.POWER_EFFICIENT:
-                selected = self._power_efficient_scheduling(available_gpus, job_request)
-            else:  # AFFINITY
-                selected = self._affinity_scheduling(available_gpus, job_request, conn)
-            
+            # Simple first-fit scheduling for Streamlit version
+            selected = [g['gpu_id'] for g in available_gpus[:job_request['requested_gpus']]]
             return selected
     
-    def _get_available_gpus(self, conn, job_request: JobRequest) -> List[Dict]:
-        """Get GPUs that meet job requirements"""
+    def _get_available_gpus(self, conn, job_request: dict) -> List[Dict]:
         query = """
             SELECT * FROM gpus 
             WHERE state = 'available' 
             AND (memory_total_mb - memory_allocated_mb) >= ?
-            AND last_heartbeat > datetime('now', '-60 seconds')
         """
-        params = [job_request.memory_per_gpu_mb]
-        
-        if job_request.gpu_type_preference:
-            query += " AND gpu_name LIKE ?"
-            params.append(f"%{job_request.gpu_type_preference}%")
-        
-        if job_request.require_nvlink:
-            query += " AND supports_nvlink = 1"
+        params = [job_request['memory_per_gpu_mb']]
         
         cursor = conn.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
-    
-    def _best_fit_scheduling(self, gpus: List[Dict], job: JobRequest) -> List[int]:
-        """Select GPUs that minimize wasted resources"""
-        # Sort by closest fit to requested memory
-        sorted_gpus = sorted(
-            gpus,
-            key=lambda g: (g['memory_total_mb'] - g['memory_allocated_mb']) - job.memory_per_gpu_mb
-        )
-        return [g['gpu_id'] for g in sorted_gpus[:job.requested_gpus]]
-    
-    def _first_fit_scheduling(self, gpus: List[Dict], job: JobRequest) -> List[int]:
-        """Select first available GPUs (fastest allocation)"""
-        return [g['gpu_id'] for g in gpus[:job.requested_gpus]]
-    
-    def _load_balanced_scheduling(self, gpus: List[Dict], job: JobRequest) -> List[int]:
-        """Distribute load evenly across GPUs"""
-        # Sort by utilization and jobs completed
-        sorted_gpus = sorted(
-            gpus,
-            key=lambda g: (g['utilization_percent'], g['total_jobs_completed'])
-        )
-        return [g['gpu_id'] for g in sorted_gpus[:job.requested_gpus]]
-    
-    def _power_efficient_scheduling(self, gpus: List[Dict], job: JobRequest) -> List[int]:
-        """Select GPUs to minimize power consumption"""
-        # Prefer GPUs already running (avoid cold start) and lower power models
-        sorted_gpus = sorted(
-            gpus,
-            key=lambda g: (
-                0 if g['utilization_percent'] > 0 else 1,  # Prefer already active
-                g['power_watts'],  # Then lower power
-                -g['memory_bandwidth_gb']  # But higher performance
-            )
-        )
-        return [g['gpu_id'] for g in sorted_gpus[:job.requested_gpus]]
-    
-    def _affinity_scheduling(self, gpus: List[Dict], job: JobRequest, conn) -> List[int]:
-        """Try to schedule jobs from same user on nearby GPUs"""
-        # Get GPUs with existing jobs from same user
-        cursor = conn.execute("""
-            SELECT DISTINCT g.gpu_id, g.node_id, g.location
-            FROM gpus g
-            JOIN job_assignments ja ON g.gpu_id = ja.gpu_id
-            JOIN jobs j ON ja.job_id = j.job_id
-            WHERE j.user_id = ? AND j.state = 'running'
-        """, (job.user_id,))
-        
-        user_nodes = {row['node_id'] for row in cursor.fetchall()}
-        
-        if user_nodes:
-            # Prefer GPUs on same nodes
-            gpus_sorted = sorted(
-                gpus,
-                key=lambda g: (0 if g['node_id'] in user_nodes else 1, g['utilization_percent'])
-            )
-            return [g['gpu_id'] for g in gpus_sorted[:job.requested_gpus]]
-        
-        # Fallback to load balanced
-        return self._load_balanced_scheduling(gpus, job)
 
 # ==============================================================================
-# Cluster Monitor
+# Streamlit App
 # ==============================================================================
 
-class ClusterMonitor:
-    """Monitors cluster health and handles failures"""
+def init_session_state():
+    """Initialize session state variables"""
+    if 'db_manager' not in st.session_state:
+        st.session_state.db_manager = DatabaseManager(DB_FILE)
+    if 'scheduler' not in st.session_state:
+        st.session_state.scheduler = GPUScheduler(st.session_state.db_manager)
+
+def get_cluster_metrics():
+    """Get current cluster metrics"""
+    db = st.session_state.db_manager
     
-    def __init__(self, db_manager: DatabaseManager):
-        self.db = db_manager
-        self.websocket_clients: Set[WebSocket] = set()
-    
-    async def start_monitoring(self):
-        """Start background monitoring tasks"""
-        asyncio.create_task(self._heartbeat_monitor())
-        asyncio.create_task(self._metrics_collector())
-        asyncio.create_task(self._cleanup_old_data())
-    
-    async def _heartbeat_monitor(self):
-        """Check GPU heartbeats and mark offline nodes"""
-        while True:
-            try:
-                with self.db.get_connection() as conn:
-                    # Find GPUs with stale heartbeats
-                    timeout_threshold = datetime.utcnow() - timedelta(seconds=HEARTBEAT_TIMEOUT_SECONDS)
-                    
-                    # SQLite doesn't support RETURNING in UPDATE, so we need to do this in two steps
-                    cursor = conn.execute("""
-                        SELECT gpu_id, node_id FROM gpus 
-                        WHERE state != 'offline' 
-                        AND last_heartbeat < ?
-                    """, (timeout_threshold.isoformat(),))
-                    
-                    offline_gpus = cursor.fetchall()
-                    
-                    if offline_gpus:
-                        # Update state to offline
-                        gpu_ids = [gpu['gpu_id'] for gpu in offline_gpus]
-                        placeholders = ','.join('?' * len(gpu_ids))
-                        conn.execute(f"""
-                            UPDATE gpus 
-                            SET state = 'offline' 
-                            WHERE gpu_id IN ({placeholders})
-                        """, gpu_ids)
-                        
-                        for gpu in offline_gpus:
-                            await self._log_event(
-                                "gpu_offline",
-                                "warning",
-                                f"gpu_{gpu['gpu_id']}",
-                                f"GPU {gpu['gpu_id']} on node {gpu['node_id']} went offline"
-                            )
-                            # TODO: Reschedule affected jobs
-                    
-                    conn.commit()
-            except Exception as e:
-                logger.error(f"Heartbeat monitor error: {e}")
-            
-            await asyncio.sleep(10)
-    
-    async def _metrics_collector(self):
-        """Collect and store cluster-wide metrics"""
-        while True:
-            try:
-                metrics = self.get_cluster_metrics()
-                await self._broadcast_metrics(metrics)
-                
-                # Store metrics history
-                with self.db.get_connection() as conn:
-                    # Sample GPU metrics
-                    conn.execute("""
-                        INSERT INTO gpu_metrics_history 
-                        (gpu_id, timestamp, temperature_celsius, utilization_percent, 
-                         memory_used_mb, power_watts)
-                        SELECT gpu_id, ?, temperature_celsius, utilization_percent,
-                               memory_used_mb, power_watts
-                        FROM gpus
-                        WHERE state = 'busy'
-                    """, (metrics.timestamp,))
-                    conn.commit()
-            except Exception as e:
-                logger.error(f"Metrics collector error: {e}")
-            
-            await asyncio.sleep(30)
-    
-    async def _cleanup_old_data(self):
-        """Clean up old metrics and completed jobs"""
-        while True:
-            try:
-                with self.db.get_connection() as conn:
-                    cutoff_date = datetime.utcnow() - timedelta(days=METRICS_RETENTION_DAYS)
-                    
-                    # Clean old metrics
-                    conn.execute(
-                        "DELETE FROM gpu_metrics_history WHERE timestamp < ?",
-                        (cutoff_date.isoformat(),)
-                    )
-                    
-                    # Archive old jobs
-                    conn.execute(
-                        "DELETE FROM jobs WHERE state IN ('completed', 'failed', 'cancelled') AND updated_at < ?",
-                        (cutoff_date.isoformat(),)
-                    )
-                    
-                    conn.commit()
-            except Exception as e:
-                logger.error(f"Cleanup error: {e}")
-            
-            await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-    
-    def get_cluster_metrics(self) -> ClusterMetrics:
-        """Get current cluster-wide metrics"""
-        with self.db.get_connection() as conn:
-            # GPU statistics
-            gpu_stats = conn.execute("""
-                SELECT 
-                    COUNT(*) as total,
-                    SUM(CASE WHEN state = 'available' THEN 1 ELSE 0 END) as available,
-                    SUM(CASE WHEN state = 'busy' THEN 1 ELSE 0 END) as busy,
-                    SUM(CASE WHEN state = 'offline' THEN 1 ELSE 0 END) as offline,
-                    SUM(memory_total_mb) as total_memory,
-                    SUM(memory_allocated_mb) as allocated_memory,
-                    AVG(CASE WHEN state = 'busy' THEN utilization_percent ELSE NULL END) as avg_util,
-                    AVG(CASE WHEN state = 'busy' THEN temperature_celsius ELSE NULL END) as avg_temp,
-                    SUM(CASE WHEN state = 'busy' THEN power_watts ELSE 0 END) as total_power
-                FROM gpus
-            """).fetchone()
-            
-            # Job statistics
-            job_stats = conn.execute("""
-                SELECT 
-                    SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END) as active,
-                    SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending
-                FROM jobs
-            """).fetchone()
-            
-            # Jobs per hour (last 24h)
-            jobs_per_hour = conn.execute("""
-                SELECT COUNT(*) / 24.0 as rate
-                FROM jobs
-                WHERE created_at > datetime('now', '-24 hours')
-            """).fetchone()['rate']
-            
-            return ClusterMetrics(
-                timestamp=datetime.utcnow().isoformat(),
-                total_gpus=gpu_stats['total'] or 0,
-                available_gpus=gpu_stats['available'] or 0,
-                busy_gpus=gpu_stats['busy'] or 0,
-                offline_gpus=gpu_stats['offline'] or 0,
-                total_memory_mb=gpu_stats['total_memory'] or 0,
-                used_memory_mb=gpu_stats['allocated_memory'] or 0,
-                average_utilization=gpu_stats['avg_util'] or 0.0,
-                average_temperature=gpu_stats['avg_temp'] or 0.0,
-                total_power_watts=gpu_stats['total_power'] or 0.0,
-                active_jobs=job_stats['active'] or 0,
-                pending_jobs=job_stats['pending'] or 0,
-                jobs_per_hour=jobs_per_hour or 0.0
-            )
-    
-    async def _log_event(self, event_type: str, severity: str, source: str, message: str, metadata: Dict = None):
-        """Log cluster events"""
-        with self.db.get_connection() as conn:
-            conn.execute("""
-                INSERT INTO cluster_events 
-                (timestamp, event_type, severity, source, message, metadata)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.utcnow().isoformat(),
-                event_type,
-                severity,
-                source,
-                message,
-                json.dumps(metadata or {})
-            ))
-            conn.commit()
-    
-    async def _broadcast_metrics(self, metrics: ClusterMetrics):
-        """Broadcast metrics to all connected WebSocket clients"""
-        if not self.websocket_clients:
-            return
-        
-        message = json.dumps({
-            "type": "metrics_update",
-            "data": metrics.dict()
-        })
-        
-        disconnected = set()
-        for client in self.websocket_clients:
-            try:
-                await client.send_text(message)
-            except:
-                disconnected.add(client)
-        
-        # Remove disconnected clients
-        self.websocket_clients -= disconnected
-
-# ==============================================================================
-# FastAPI Application
-# ==============================================================================
-
-app = FastAPI(
-    title="GPU Cluster Control Plane",
-    description="Advanced GPU cluster management with scheduling, monitoring, and job management",
-    version="2.0.0"
-)
-
-# Initialize components
-db_manager = DatabaseManager(DB_FILE)
-scheduler = GPUScheduler(db_manager)
-monitor = ClusterMonitor(db_manager)
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    await monitor.start_monitoring()
-    logger.info("GPU Cluster Control Plane started")
-
-# ==============================================================================
-# GPU Management Endpoints
-# ==============================================================================
-
-@app.post("/register", response_model=Dict[str, Any], tags=["GPU Management"])
-async def register_gpu(request: RegisterGPURequest):
-    """Register a new GPU node in the cluster"""
-    try:
-        with db_manager.get_connection() as conn:
-            # Check if node already exists
-            existing = conn.execute(
-                "SELECT gpu_id FROM gpus WHERE node_id = ?",
-                (request.node_id,)
-            ).fetchone()
-            
-            if existing:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Node {request.node_id} already registered"
-                )
-            
-            # Insert new GPU
-            now = datetime.utcnow().isoformat()
-            cursor = conn.execute("""
-                INSERT INTO gpus (
-                    node_id, hostname, gpu_name, gpu_uuid, vendor,
-                    memory_total_mb, driver_version, location, tags,
-                    compute_capability, cuda_cores, tensor_cores,
-                    memory_bandwidth_gb, pcie_gen, supports_nvlink, supports_mig,
-                    registered_at, last_heartbeat
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                request.node_id, request.hostname, request.gpu_name,
-                request.gpu_uuid, request.vendor, request.memory_total_mb,
-                request.driver_version, request.location, json.dumps(request.tags),
-                request.capabilities.compute_capability if request.capabilities else "",
-                request.capabilities.cuda_cores if request.capabilities else 0,
-                request.capabilities.tensor_cores if request.capabilities else 0,
-                request.capabilities.memory_bandwidth_gb if request.capabilities else 0,
-                request.capabilities.pcie_gen if request.capabilities else 3,
-                request.capabilities.supports_nvlink if request.capabilities else False,
-                request.capabilities.supports_mig if request.capabilities else False,
-                now, now
-            ))
-            conn.commit()
-            
-            gpu_id = cursor.lastrowid
-            
-            await monitor._log_event(
-                "gpu_registered",
-                "info",
-                f"gpu_{gpu_id}",
-                f"GPU {request.gpu_name} registered on node {request.node_id}"
-            )
-            
-            return {
-                "gpu_id": gpu_id,
-                "status": "registered",
-                "message": f"GPU {request.gpu_name} successfully registered"
-            }
-            
-    except sqlite3.Error as e:
-        logger.error(f"Database error during GPU registration: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to register GPU"
-        )
-
-@app.delete("/gpu/{node_id}", tags=["GPU Management"])
-async def deregister_gpu(node_id: str = PathParam(..., description="Node ID to deregister")):
-    """Remove a GPU from the cluster"""
-    with db_manager.get_connection() as conn:
-        # Check if GPU exists and has active jobs
-        gpu = conn.execute(
-            "SELECT gpu_id, state FROM gpus WHERE node_id = ?",
-            (node_id,)
-        ).fetchone()
-        
-        if not gpu:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"GPU node {node_id} not found"
-            )
-        
-        if gpu['state'] == 'busy':
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Cannot remove GPU with active jobs"
-            )
-        
-        # Remove GPU
-        conn.execute("DELETE FROM gpus WHERE node_id = ?", (node_id,))
-        conn.commit()
-        
-        await monitor._log_event(
-            "gpu_deregistered",
-            "info",
-            f"gpu_{gpu['gpu_id']}",
-            f"GPU on node {node_id} removed from cluster"
-        )
-        
-        return {"message": f"GPU node {node_id} successfully removed"}
-
-@app.patch("/gpu/{node_id}/metrics", tags=["GPU Management"])
-async def update_gpu_metrics(
-    node_id: str,
-    metrics: UpdateGPUMetricsRequest
-):
-    """Update real-time GPU metrics (called by GPU nodes)"""
-    with db_manager.get_connection() as conn:
-        # Build dynamic update query
-        updates = []
-        values = []
-        
-        for field, value in metrics.dict(exclude_none=True).items():
-            updates.append(f"{field} = ?")
-            values.append(value)
-        
-        if not updates:
-            return {"message": "No metrics to update"}
-        
-        # Add heartbeat update
-        updates.append("last_heartbeat = ?")
-        values.append(datetime.utcnow().isoformat())
-        
-        # Update GPU metrics
-        values.append(node_id)
-        result = conn.execute(
-            f"UPDATE gpus SET {', '.join(updates)} WHERE node_id = ?",
-            values
-        )
-        
-        if result.rowcount == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"GPU node {node_id} not found"
-            )
-        
-        conn.commit()
-        
-        return {"message": "Metrics updated successfully"}
-
-@app.patch("/gpu/{node_id}/state", tags=["GPU Management"])
-async def update_gpu_state(
-    node_id: str,
-    state: GPUState
-):
-    """Manually set GPU state (for maintenance, etc.)"""
-    with db_manager.get_connection() as conn:
-        result = conn.execute(
-            "UPDATE gpus SET state = ? WHERE node_id = ?",
-            (state.value, node_id)
-        )
-        
-        if result.rowcount == 0:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"GPU node {node_id} not found"
-            )
-        
-        conn.commit()
-        
-        await monitor._log_event(
-            "gpu_state_change",
-            "info",
-            f"node_{node_id}",
-            f"GPU state changed to {state.value}"
-        )
-        
-        return {"message": f"GPU state updated to {state.value}"}
-
-# ==============================================================================
-# Cluster Status Endpoints
-# ==============================================================================
-
-@app.get("/status", response_model=Dict[str, Any], tags=["Cluster Status"])
-async def get_cluster_status(
-    format: str = Query("summary", pattern="^(summary|detailed|json)$"),
-    include_metrics: bool = Query(False, description="Include performance metrics")
-):
-    """Get comprehensive cluster health overview"""
-    with db_manager.get_connection() as conn:
-        # Get all GPUs
-        gpus = conn.execute("""
-            SELECT gpu_id, node_id, hostname, gpu_name, vendor, state,
-                   memory_total_mb, memory_allocated_mb, memory_used_mb,
-                   temperature_celsius, utilization_percent, power_watts,
-                   last_heartbeat, location, tags
+    with db.get_connection() as conn:
+        # GPU statistics
+        gpu_stats = conn.execute("""
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN state = 'available' THEN 1 ELSE 0 END) as available,
+                SUM(CASE WHEN state = 'busy' THEN 1 ELSE 0 END) as busy,
+                SUM(CASE WHEN state = 'offline' THEN 1 ELSE 0 END) as offline,
+                SUM(memory_total_mb) as total_memory,
+                SUM(memory_allocated_mb) as allocated_memory,
+                AVG(CASE WHEN state != 'offline' THEN utilization_percent ELSE NULL END) as avg_util,
+                AVG(CASE WHEN state != 'offline' THEN temperature_celsius ELSE NULL END) as avg_temp,
+                SUM(CASE WHEN state != 'offline' THEN power_watts ELSE 0 END) as total_power
             FROM gpus
-            ORDER BY gpu_id
-        """).fetchall()
+        """).fetchone()
         
-        # Get running jobs
-        jobs = conn.execute("""
-            SELECT j.job_id, j.job_name, j.user_id, j.state, 
-                   COUNT(ja.gpu_id) as gpu_count
-            FROM jobs j
-            LEFT JOIN job_assignments ja ON j.job_id = ja.job_id
-            WHERE j.state IN ('running', 'scheduled')
-            GROUP BY j.job_id
-        """).fetchall()
-        
-        # Get cluster metrics
-        metrics = monitor.get_cluster_metrics() if include_metrics else None
-        
-        if format == "summary":
-            # Human-readable summary
-            lines = [
-                f"=== GPU CLUSTER STATUS ===",
-                f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                f"",
-                f"GPUs: {metrics.available_gpus}/{metrics.total_gpus} available" if metrics else "GPUs: N/A",
-                f"Memory: {metrics.used_memory_mb:,}/{metrics.total_memory_mb:,} MB used" if metrics else "Memory: N/A",
-                f"Power: {metrics.total_power_watts:.1f}W" if metrics else "Power: N/A",
-                f"Jobs: {metrics.active_jobs} running, {metrics.pending_jobs} pending" if metrics else "Jobs: N/A",
-                f"",
-                f"GPU Details:"
-            ]
-            
-            for gpu in gpus:
-                state_icon = {
-                    'available': '✓',
-                    'busy': '●',
-                    'offline': '✗',
-                    'maintenance': '🔧',
-                    'error': '⚠'
-                }.get(gpu['state'], '?')
-                
-                mem_used_pct = (gpu['memory_allocated_mb'] / gpu['memory_total_mb'] * 100) if gpu['memory_total_mb'] > 0 else 0
-                
-                lines.append(
-                    f"  [{state_icon}] GPU {gpu['gpu_id']:2d}: {gpu['gpu_name']:20s} "
-                    f"| {gpu['utilization_percent']:3.0f}% util "
-                    f"| {gpu['temperature_celsius']:3.0f}°C "
-                    f"| {gpu['memory_allocated_mb']:5d}/{gpu['memory_total_mb']:5d} MB ({mem_used_pct:3.0f}%)"
-                )
-            
-            return {"status": "\n".join(lines)}
-            
-        elif format == "detailed":
-            # Detailed view with all information
-            gpu_details = []
-            for gpu in gpus:
-                gpu_dict = dict(gpu)
-                gpu_dict['tags'] = json.loads(gpu_dict.get('tags', '[]'))
-                
-                # Get jobs on this GPU
-                gpu_jobs = conn.execute("""
-                    SELECT j.job_id, j.job_name, j.user_id
-                    FROM job_assignments ja
-                    JOIN jobs j ON ja.job_id = j.job_id
-                    WHERE ja.gpu_id = ? AND ja.released_at IS NULL
-                """, (gpu['gpu_id'],)).fetchall()
-                
-                gpu_dict['active_jobs'] = [dict(j) for j in gpu_jobs]
-                gpu_details.append(gpu_dict)
-            
-            return {
-                "timestamp": datetime.utcnow().isoformat(),
-                "cluster_metrics": metrics.dict() if metrics else None,
-                "gpus": gpu_details,
-                "active_jobs": [dict(j) for j in jobs]
-            }
-            
-        else:  # json format
-            return {
-                "timestamp": datetime.utcnow().isoformat(),
-                "metrics": metrics.dict() if metrics else None,
-                "gpus": [dict(g) for g in gpus],
-                "jobs": [dict(j) for j in jobs]
-            }
-
-@app.get("/status/gpu/{node_id}", tags=["Cluster Status"])
-async def get_gpu_status(node_id: str):
-    """Get detailed status for a specific GPU"""
-    with db_manager.get_connection() as conn:
-        gpu = conn.execute(
-            "SELECT * FROM gpus WHERE node_id = ?",
-            (node_id,)
-        ).fetchone()
-        
-        if not gpu:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"GPU node {node_id} not found"
-            )
-        
-        gpu_dict = dict(gpu)
-        gpu_dict['tags'] = json.loads(gpu_dict.get('tags', '[]'))
-        
-        # Get current jobs
-        jobs = conn.execute("""
-            SELECT j.* FROM jobs j
-            JOIN job_assignments ja ON j.job_id = ja.job_id
-            WHERE ja.gpu_id = ? AND ja.released_at IS NULL
-        """, (gpu['gpu_id'],)).fetchall()
-        
-        gpu_dict['current_jobs'] = [dict(j) for j in jobs]
-        
-        # Get recent metrics
-        metrics = conn.execute("""
-            SELECT timestamp, temperature_celsius, utilization_percent, 
-                   memory_used_mb, power_watts
-            FROM gpu_metrics_history
-            WHERE gpu_id = ?
-            ORDER BY timestamp DESC
-            LIMIT 100
-        """, (gpu['gpu_id'],)).fetchall()
-        
-        gpu_dict['recent_metrics'] = [dict(m) for m in metrics]
-        
-        return gpu_dict
-
-@app.get("/metrics", response_model=ClusterMetrics, tags=["Cluster Status"])
-async def get_cluster_metrics():
-    """Get current cluster-wide metrics"""
-    return monitor.get_cluster_metrics()
-
-@app.get("/metrics/history", tags=["Cluster Status"])
-async def get_metrics_history(
-    hours: int = Query(24, ge=1, le=168, description="Hours of history to retrieve"),
-    gpu_id: Optional[int] = Query(None, description="Filter by specific GPU")
-):
-    """Get historical metrics data"""
-    cutoff_time = datetime.utcnow() - timedelta(hours=hours)
-    
-    with db_manager.get_connection() as conn:
-        query = """
-            SELECT gpu_id, timestamp, temperature_celsius, 
-                   utilization_percent, memory_used_mb, power_watts
-            FROM gpu_metrics_history
-            WHERE timestamp > ?
-        """
-        params = [cutoff_time.isoformat()]
-        
-        if gpu_id is not None:
-            query += " AND gpu_id = ?"
-            params.append(gpu_id)
-        
-        query += " ORDER BY timestamp DESC"
-        
-        metrics = conn.execute(query, params).fetchall()
+        # Job statistics
+        job_stats = conn.execute("""
+            SELECT 
+                SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END) as active,
+                SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) as pending
+            FROM jobs
+        """).fetchone()
         
         return {
-            "start_time": cutoff_time.isoformat(),
-            "end_time": datetime.utcnow().isoformat(),
-            "metrics": [dict(m) for m in metrics]
+            'total_gpus': gpu_stats['total'] or 0,
+            'available_gpus': gpu_stats['available'] or 0,
+            'busy_gpus': gpu_stats['busy'] or 0,
+            'offline_gpus': gpu_stats['offline'] or 0,
+            'total_memory_mb': gpu_stats['total_memory'] or 0,
+            'allocated_memory_mb': gpu_stats['allocated_memory'] or 0,
+            'average_utilization': gpu_stats['avg_util'] or 0.0,
+            'average_temperature': gpu_stats['avg_temp'] or 0.0,
+            'total_power_watts': gpu_stats['total_power'] or 0.0,
+            'active_jobs': job_stats['active'] or 0,
+            'pending_jobs': job_stats['pending'] or 0
         }
 
-@app.get("/events", tags=["Cluster Status"])
-async def get_cluster_events(
-    hours: int = Query(24, ge=1, le=168),
-    severity: Optional[str] = Query(None, pattern="^(info|warning|error)$"),
-    event_type: Optional[str] = None
-):
-    """Get cluster event log"""
+def render_overview_tab():
+    """Render the overview dashboard"""
+    st.header("🎛️ Cluster Overview")
+    
+    # Auto-refresh checkbox
+    auto_refresh = st.checkbox("Auto-refresh (5s)", value=True, key="overview_refresh")
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+    
+    # Get metrics
+    metrics = get_cluster_metrics()
+    
+    # Key metrics cards
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "Total GPUs", 
+            metrics['total_gpus'],
+            help="Total number of registered GPUs"
+        )
+    
+    with col2:
+        available_pct = (metrics['available_gpus'] / max(metrics['total_gpus'], 1)) * 100
+        st.metric(
+            "Available GPUs", 
+            f"{metrics['available_gpus']}/{metrics['total_gpus']}",
+            delta=f"{available_pct:.1f}% available",
+            help="GPUs ready for job assignment"
+        )
+    
+    with col3:
+        st.metric(
+            "Active Jobs", 
+            metrics['active_jobs'],
+            delta=f"{metrics['pending_jobs']} queued",
+            help="Currently running and pending jobs"
+        )
+    
+    with col4:
+        memory_used_pct = (metrics['allocated_memory_mb'] / max(metrics['total_memory_mb'], 1)) * 100
+        st.metric(
+            "Memory Usage", 
+            f"{memory_used_pct:.1f}%",
+            delta=f"{metrics['allocated_memory_mb']:,} MB used",
+            help="GPU memory allocation across cluster"
+        )
+    
+    # Performance metrics
+    st.subheader("Performance Metrics")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            "Avg Utilization",
+            f"{metrics['average_utilization']:.1f}%",
+            help="Average GPU utilization across active GPUs"
+        )
+    
+    with col2:
+        st.metric(
+            "Avg Temperature",
+            f"{metrics['average_temperature']:.1f}°C",
+            help="Average temperature across active GPUs"
+        )
+    
+    with col3:
+        st.metric(
+            "Total Power",
+            f"{metrics['total_power_watts']:.0f}W",
+            help="Total power consumption"
+        )
+
+def render_gpus_tab():
+    """Render GPU management tab"""
+    st.header("🖥️ GPU Management")
+    
+    db = st.session_state.db_manager
+    
+    # GPU registration form
+    with st.expander("Register New GPU", expanded=False):
+        with st.form("register_gpu_form"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                node_id = st.text_input("Node ID*", help="Unique identifier for this GPU node")
+                hostname = st.text_input("Hostname*", help="Server hostname")
+                gpu_name = st.text_input("GPU Name*", placeholder="e.g., RTX 4090", help="GPU model name")
+                memory_mb = st.number_input("Memory (MB)*", min_value=1024, value=24576, help="Total GPU memory in MB")
+            
+            with col2:
+                vendor = st.selectbox("Vendor", ["NVIDIA", "AMD", "Intel"], help="GPU manufacturer")
+                driver_version = st.text_input("Driver Version", placeholder="e.g., 535.129.03", help="GPU driver version")
+                location = st.text_input("Location", placeholder="e.g., rack-1", help="Physical location")
+                tags = st.text_input("Tags (comma-separated)", placeholder="e.g., compute, training", help="GPU tags for organization")
+            
+            submitted = st.form_submit_button("Register GPU", type="primary")
+            
+            if submitted:
+                if not all([node_id, hostname, gpu_name]):
+                    st.error("Please fill in all required fields (marked with *)")
+                else:
+                    try:
+                        with db.get_connection() as conn:
+                            # Check if already exists
+                            existing = conn.execute(
+                                "SELECT gpu_id FROM gpus WHERE node_id = ?", 
+                                (node_id,)
+                            ).fetchone()
+                            
+                            if existing:
+                                st.error(f"GPU with node ID '{node_id}' already exists")
+                            else:
+                                now = datetime.utcnow().isoformat()
+                                tag_list = [t.strip() for t in tags.split(',') if t.strip()]
+                                
+                                cursor = conn.execute("""
+                                    INSERT INTO gpus (
+                                        node_id, hostname, gpu_name, vendor,
+                                        memory_total_mb, driver_version, location, tags,
+                                        registered_at, last_heartbeat
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (
+                                    node_id, hostname, gpu_name, vendor,
+                                    memory_mb, driver_version, location, json.dumps(tag_list),
+                                    now, now
+                                ))
+                                conn.commit()
+                                
+                                st.success(f"Successfully registered GPU '{gpu_name}' on node '{node_id}'")
+                                st.rerun()
+                    except Exception as e:
+                        st.error(f"Error registering GPU: {e}")
+
+    # GPU list and management
+    with db.get_connection() as conn:
+        gpus = conn.execute("""
+            SELECT * FROM gpus 
+            ORDER BY gpu_id
+        """).fetchall()
+    
+    if gpus:
+        st.subheader("GPU Cluster Status")
+        
+        # Create DataFrame for display
+        gpu_data = []
+        for gpu in gpus:
+            gpu_dict = dict(gpu)
+            gpu_dict['tags'] = ', '.join(json.loads(gpu_dict.get('tags', '[]')))
+            
+            # Memory usage percentage
+            if gpu_dict['memory_total_mb'] > 0:
+                gpu_dict['memory_usage_pct'] = (gpu_dict['memory_allocated_mb'] / gpu_dict['memory_total_mb']) * 100
+            else:
+                gpu_dict['memory_usage_pct'] = 0
+            
+            gpu_data.append(gpu_dict)
+        
+        df = pd.DataFrame(gpu_data)
+        
+        # State filter
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            state_filter = st.selectbox(
+                "Filter by State",
+                options=["All"] + [state.value for state in GPUState],
+                key="gpu_state_filter"
+            )
+        
+        if state_filter != "All":
+            df = df[df['state'] == state_filter]
+        
+        # Display GPU cards
+        for idx, gpu in df.iterrows():
+            with st.container():
+                # State indicator
+                state_colors = {
+                    'available': '🟢',
+                    'busy': '🟡',
+                    'offline': '🔴',
+                    'maintenance': '🔧',
+                    'error': '⚠️'
+                }
+                
+                state_icon = state_colors.get(gpu['state'], '❓')
+                
+                col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                
+                with col1:
+                    st.markdown(f"**{state_icon} GPU {gpu['gpu_id']}: {gpu['gpu_name']}**")
+                    st.caption(f"Node: {gpu['node_id']} | Host: {gpu['hostname']}")
+                
+                with col2:
+                    st.metric(
+                        "Utilization", 
+                        f"{gpu['utilization_percent']:.1f}%",
+                        help="GPU utilization percentage"
+                    )
+                
+                with col3:
+                    st.metric(
+                        "Memory", 
+                        f"{gpu['memory_usage_pct']:.1f}%",
+                        delta=f"{gpu['memory_allocated_mb']}/{gpu['memory_total_mb']} MB",
+                        help="Memory allocation"
+                    )
+                
+                with col4:
+                    if st.button(f"Manage", key=f"manage_gpu_{gpu['gpu_id']}"):
+                        st.session_state.selected_gpu = gpu['gpu_id']
+                        st.rerun()
+                
+                st.divider()
+        
+        # GPU management modal
+        if 'selected_gpu' in st.session_state:
+            gpu_id = st.session_state.selected_gpu
+            selected_gpu = df[df['gpu_id'] == gpu_id].iloc[0]
+            
+            st.subheader(f"Manage GPU {gpu_id}")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                new_state = st.selectbox(
+                    "Change State",
+                    options=[state.value for state in GPUState],
+                    index=[state.value for state in GPUState].index(selected_gpu['state']),
+                    key=f"state_select_{gpu_id}"
+                )
+                
+                if st.button("Update State", key=f"update_state_{gpu_id}"):
+                    with db.get_connection() as conn:
+                        conn.execute(
+                            "UPDATE gpus SET state = ? WHERE gpu_id = ?",
+                            (new_state, gpu_id)
+                        )
+                        conn.commit()
+                    st.success(f"Updated GPU {gpu_id} state to {new_state}")
+                    del st.session_state.selected_gpu
+                    st.rerun()
+            
+            with col2:
+                if st.button("Remove GPU", key=f"remove_gpu_{gpu_id}", type="secondary"):
+                    if selected_gpu['state'] == 'busy':
+                        st.error("Cannot remove GPU with active jobs")
+                    else:
+                        with db.get_connection() as conn:
+                            conn.execute("DELETE FROM gpus WHERE gpu_id = ?", (gpu_id,))
+                            conn.commit()
+                        st.success(f"Removed GPU {gpu_id}")
+                        del st.session_state.selected_gpu
+                        st.rerun()
+            
+            if st.button("Close", key=f"close_manage_{gpu_id}"):
+                del st.session_state.selected_gpu
+                st.rerun()
+    
+    else:
+        st.info("No GPUs registered yet. Use the form above to register your first GPU.")
+        
+        # Demo data button
+        if st.button("Create Demo GPUs", type="primary"):
+            create_demo_gpus()
+            st.rerun()
+
+def render_jobs_tab():
+    """Render job management tab"""
+    st.header("🔄 Job Management")
+    
+    db = st.session_state.db_manager
+    scheduler = st.session_state.scheduler
+    
+    # Job submission form
+    with st.expander("Submit New Job", expanded=False):
+        with st.form("submit_job_form"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                job_name = st.text_input("Job Name*", help="Descriptive name for this job")
+                user_id = st.text_input("User ID*", help="User submitting the job")
+                requested_gpus = st.number_input("Requested GPUs", min_value=1, max_value=8, value=1, help="Number of GPUs needed")
+                memory_per_gpu = st.number_input("Memory per GPU (MB)", min_value=1024, value=8192, help="Memory required per GPU")
+            
+            with col2:
+                priority = st.slider("Priority", min_value=1, max_value=10, value=5, help="Job priority (10 = highest)")
+                duration = st.number_input("Expected Duration (minutes)", min_value=1, value=60, help="Expected job runtime")
+                strategy = st.selectbox("Scheduling Strategy", options=[s.value for s in SchedulingStrategy], help="GPU allocation strategy")
+                gpu_type = st.text_input("GPU Type Preference", placeholder="e.g., RTX 4090", help="Preferred GPU model (optional)")
+            
+            submitted = st.form_submit_button("Submit Job", type="primary")
+            
+            if submitted:
+                if not all([job_name, user_id]):
+                    st.error("Please fill in all required fields")
+                else:
+                    try:
+                        job_id = str(uuid.uuid4())
+                        now = datetime.utcnow().isoformat()
+                        
+                        job_request = {
+                            'requested_gpus': requested_gpus,
+                            'memory_per_gpu_mb': memory_per_gpu,
+                            'gpu_type_preference': gpu_type if gpu_type else None
+                        }
+                        
+                        # Try to schedule immediately
+                        assigned_gpus = scheduler.schedule_job(job_request)
+                        
+                        with db.get_connection() as conn:
+                            # Create job record
+                            if assigned_gpus:
+                                state = JobState.SCHEDULED.value
+                                scheduled_at = now
+                            else:
+                                state = JobState.PENDING.value
+                                scheduled_at = None
+                            
+                            conn.execute("""
+                                INSERT INTO jobs (
+                                    job_id, job_name, user_id, priority, requested_gpus,
+                                    memory_per_gpu_mb, expected_duration_minutes,
+                                    scheduling_strategy, gpu_type_preference,
+                                    state, scheduled_at, created_at, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                job_id, job_name, user_id, priority, requested_gpus,
+                                memory_per_gpu, duration, strategy, gpu_type,
+                                state, scheduled_at, now, now
+                            ))
+                            
+                            if assigned_gpus:
+                                # Create assignments and update GPU states
+                                for gpu_id in assigned_gpus:
+                                    conn.execute("""
+                                        INSERT INTO job_assignments (job_id, gpu_id, assigned_at)
+                                        VALUES (?, ?, ?)
+                                    """, (job_id, gpu_id, now))
+                                    
+                                    conn.execute("""
+                                        UPDATE gpus 
+                                        SET state = 'busy', memory_allocated_mb = memory_allocated_mb + ?
+                                        WHERE gpu_id = ?
+                                    """, (memory_per_gpu, gpu_id))
+                            
+                            conn.commit()
+                            
+                            if assigned_gpus:
+                                st.success(f"Job '{job_name}' scheduled on GPUs: {assigned_gpus}")
+                            else:
+                                st.info(f"Job '{job_name}' queued - waiting for available resources")
+                            
+                            st.rerun()
+                            
+                    except Exception as e:
+                        st.error(f"Error submitting job: {e}")
+
+    # Job list and management
+    with db.get_connection() as conn:
+        jobs = conn.execute("""
+            SELECT j.*, 
+                   GROUP_CONCAT(ja.gpu_id) as assigned_gpu_ids
+            FROM jobs j
+            LEFT JOIN job_assignments ja ON j.job_id = ja.job_id AND ja.released_at IS NULL
+            GROUP BY j.job_id
+            ORDER BY j.created_at DESC
+            LIMIT 50
+        """).fetchall()
+    
+    if jobs:
+        st.subheader("Job Queue")
+        
+        # State filter
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            job_state_filter = st.selectbox(
+                "Filter by State",
+                options=["All"] + [state.value for state in JobState],
+                key="job_state_filter"
+            )
+        
+        # Create jobs DataFrame
+        job_data = []
+        for job in jobs:
+            job_dict = dict(job)
+            if job_dict['assigned_gpu_ids']:
+                job_dict['assigned_gpus'] = job_dict['assigned_gpu_ids'].split(',')
+            else:
+                job_dict['assigned_gpus'] = []
+            job_data.append(job_dict)
+        
+        df_jobs = pd.DataFrame(job_data)
+        
+        if job_state_filter != "All":
+            df_jobs = df_jobs[df_jobs['state'] == job_state_filter]
+        
+        # Display job cards
+        for idx, job in df_jobs.iterrows():
+            with st.container():
+                state_colors = {
+                    'pending': '🟡',
+                    'scheduled': '🔵',
+                    'running': '🟢',
+                    'completed': '✅',
+                    'failed': '❌',
+                    'cancelled': '⏹️'
+                }
+                
+                state_icon = state_colors.get(job['state'], '❓')
+                
+                col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                
+                with col1:
+                    st.markdown(f"**{state_icon} {job['job_name']}**")
+                    st.caption(f"ID: {job['job_id'][:8]}... | User: {job['user_id']}")
+                
+                with col2:
+                    st.write(f"**State:** {job['state']}")
+                    st.write(f"**Priority:** {job['priority']}")
+                
+                with col3:
+                    st.write(f"**GPUs:** {job['requested_gpus']}")
+                    if job['assigned_gpus']:
+                        st.write(f"**Assigned:** {', '.join(job['assigned_gpus'])}")
+                
+                with col4:
+                    # Job action buttons
+                    if job['state'] in ['pending', 'scheduled', 'running']:
+                        if st.button("Cancel", key=f"cancel_job_{job['job_id']}", type="secondary"):
+                            cancel_job(job['job_id'])
+                            st.rerun()
+                    
+                    if job['state'] == 'scheduled':
+                        if st.button("Start", key=f"start_job_{job['job_id']}", type="primary"):
+                            update_job_state(job['job_id'], JobState.RUNNING.value)
+                            st.rerun()
+                
+                st.divider()
+    
+    else:
+        st.info("No jobs in the system yet. Submit a job using the form above.")
+
+def render_monitoring_tab():
+    """Render monitoring and analytics tab"""
+    st.header("📊 Monitoring & Analytics")
+    
+    db = st.session_state.db_manager
+    
+    # Time range selector
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        hours = st.selectbox("Time Range", options=[1, 6, 12, 24, 48, 168], index=3, format_func=lambda x: f"Last {x} hours")
+    
+    # Get metrics data
     cutoff_time = datetime.utcnow() - timedelta(hours=hours)
     
-    with db_manager.get_connection() as conn:
+    with db.get_connection() as conn:
+        # GPU metrics history
+        metrics_data = conn.execute("""
+            SELECT gpu_id, timestamp, temperature_celsius, utilization_percent, 
+                   memory_used_mb, power_watts
+            FROM gpu_metrics_history
+            WHERE timestamp > ?
+            ORDER BY timestamp
+        """, (cutoff_time.isoformat(),)).fetchall()
+        
+        # GPU info for labels
+        gpu_info = conn.execute("""
+            SELECT gpu_id, node_id, gpu_name FROM gpus
+        """).fetchall()
+        
+        gpu_names = {gpu['gpu_id']: f"GPU {gpu['gpu_id']} ({gpu['gpu_name']})" for gpu in gpu_info}
+    
+    if metrics_data:
+        df_metrics = pd.DataFrame(metrics_data)
+        df_metrics['timestamp'] = pd.to_datetime(df_metrics['timestamp'])
+        df_metrics['gpu_label'] = df_metrics['gpu_id'].map(gpu_names)
+        
+        # Charts
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("GPU Utilization Over Time")
+            if not df_metrics.empty:
+                fig_util = px.line(                    df_metrics, 
+                    x='timestamp', 
+                    y='utilization_percent', 
+                    color='gpu_label',
+                    title="GPU Utilization (%)",
+                    labels={'utilization_percent': 'Utilization (%)', 'timestamp': 'Time'}
+                )
+                fig_util.update_layout(height=400)
+                st.plotly_chart(fig_util, use_container_width=True)
+        
+        with col2:
+            st.subheader("Temperature Monitoring")
+            if not df_metrics.empty:
+                fig_temp = px.line(
+                    df_metrics, 
+                    x='timestamp', 
+                    y='temperature_celsius', 
+                    color='gpu_label',
+                    title="GPU Temperature (°C)",
+                    labels={'temperature_celsius': 'Temperature (°C)', 'timestamp': 'Time'}
+                )
+                fig_temp.update_layout(height=400)
+                st.plotly_chart(fig_temp, use_container_width=True)
+        
+        # Power consumption chart
+        st.subheader("Power Consumption")
+        if not df_metrics.empty and 'power_watts' in df_metrics.columns:
+            fig_power = px.area(
+                df_metrics, 
+                x='timestamp', 
+                y='power_watts', 
+                color='gpu_label',
+                title="Power Consumption Over Time (Watts)",
+                labels={'power_watts': 'Power (W)', 'timestamp': 'Time'}
+            )
+            fig_power.update_layout(height=400)
+            st.plotly_chart(fig_power, use_container_width=True)
+        
+        # Current status heatmap
+        st.subheader("Current GPU Status Heatmap")
+        with db.get_connection() as conn:
+            current_gpus = conn.execute("""
+                SELECT gpu_id, node_id, gpu_name, utilization_percent, 
+                       temperature_celsius, state
+                FROM gpus
+                ORDER BY gpu_id
+            """).fetchall()
+        
+        if current_gpus:
+            df_current = pd.DataFrame(current_gpus)
+            
+            # Create heatmap data
+            heatmap_data = df_current.pivot_table(
+                index='gpu_name', 
+                columns='node_id', 
+                values='utilization_percent', 
+                aggfunc='first'
+            ).fillna(0)
+            
+            if not heatmap_data.empty:
+                fig_heatmap = px.imshow(
+                    heatmap_data,
+                    title="GPU Utilization Heatmap",
+                    labels={'color': 'Utilization (%)'},
+                    color_continuous_scale='RdYlGn_r'
+                )
+                fig_heatmap.update_layout(height=300)
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+    
+    else:
+        st.info("No metrics data available for the selected time range.")
+        st.write("Metrics are collected when GPUs are active and reporting telemetry.")
+    
+    # Real-time cluster stats
+    st.subheader("Real-time Cluster Statistics")
+    
+    metrics = get_cluster_metrics()
+    
+    # Create gauge charts
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        fig_util_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number+delta",
+            value = metrics['average_utilization'],
+            domain = {'x': [0, 1], 'y': [0, 1]},
+            title = {'text': "Avg Utilization (%)"},
+            gauge = {
+                'axis': {'range': [None, 100]},
+                'bar': {'color': "darkblue"},
+                'steps': [
+                    {'range': [0, 25], 'color': "lightgray"},
+                    {'range': [25, 50], 'color': "yellow"},
+                    {'range': [50, 75], 'color': "orange"},
+                    {'range': [75, 100], 'color': "red"}
+                ],
+                'threshold': {
+                    'line': {'color': "red", 'width': 4},
+                    'thickness': 0.75,
+                    'value': 90
+                }
+            }
+        ))
+        fig_util_gauge.update_layout(height=250, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_util_gauge, use_container_width=True)
+    
+    with col2:
+        fig_temp_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number",
+            value = metrics['average_temperature'],
+            domain = {'x': [0, 1], 'y': [0, 1]},
+            title = {'text': "Avg Temperature (°C)"},
+            gauge = {
+                'axis': {'range': [None, 100]},
+                'bar': {'color': "darkgreen"},
+                'steps': [
+                    {'range': [0, 60], 'color': "lightgray"},
+                    {'range': [60, 75], 'color': "yellow"},
+                    {'range': [75, 85], 'color': "orange"},
+                    {'range': [85, 100], 'color': "red"}
+                ],
+                'threshold': {
+                    'line': {'color': "red", 'width': 4},
+                    'thickness': 0.75,
+                    'value': 80
+                }
+            }
+        ))
+        fig_temp_gauge.update_layout(height=250, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_temp_gauge, use_container_width=True)
+    
+    with col3:
+        memory_usage_pct = (metrics['allocated_memory_mb'] / max(metrics['total_memory_mb'], 1)) * 100
+        fig_memory_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number",
+            value = memory_usage_pct,
+            domain = {'x': [0, 1], 'y': [0, 1]},
+            title = {'text': "Memory Usage (%)"},
+            gauge = {
+                'axis': {'range': [None, 100]},
+                'bar': {'color': "purple"},
+                'steps': [
+                    {'range': [0, 50], 'color': "lightgray"},
+                    {'range': [50, 75], 'color': "yellow"},
+                    {'range': [75, 90], 'color': "orange"},
+                    {'range': [90, 100], 'color': "red"}
+                ]
+            }
+        ))
+        fig_memory_gauge.update_layout(height=250, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_memory_gauge, use_container_width=True)
+
+def render_events_tab():
+    """Render events and logs tab"""
+    st.header("📝 Events & Logs")
+    
+    db = st.session_state.db_manager
+    
+    # Controls
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        hours = st.selectbox("Time Range", options=[1, 6, 12, 24, 48, 168], index=2, format_func=lambda x: f"Last {x} hours")
+    with col2:
+        severity_filter = st.selectbox("Severity", options=["All", "info", "warning", "error"])
+    with col3:
+        if st.button("Refresh Logs"):
+            st.rerun()
+    
+    cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+    
+    with db.get_connection() as conn:
         query = "SELECT * FROM cluster_events WHERE timestamp > ?"
         params = [cutoff_time.isoformat()]
         
-        if severity:
+        if severity_filter != "All":
             query += " AND severity = ?"
-            params.append(severity)
-        
-        if event_type:
-            query += " AND event_type = ?"
-            params.append(event_type)
+            params.append(severity_filter)
         
         query += " ORDER BY timestamp DESC LIMIT 1000"
         
         events = conn.execute(query, params).fetchall()
-        
-        return {
-            "events": [
-                {
-                    **dict(e),
-                    "metadata": json.loads(e['metadata'])
-                } for e in events
-            ]
-        }
-
-# ==============================================================================
-# Job Management Endpoints
-# ==============================================================================
-
-@app.post("/submit_job", response_model=JobResponse, tags=["Job Management"])
-async def submit_job(request: JobRequest):
-    """Submit a new job to the cluster"""
-    job_id = str(uuid.uuid4())
-    now = datetime.isoformat()
     
-    with db_manager.get_connection() as conn:
-        # Create job record
-        conn.execute("""
-            INSERT INTO jobs (
-                job_id, job_name, user_id, priority, requested_gpus,
-                memory_per_gpu_mb, expected_duration_minutes,
-                scheduling_strategy, gpu_type_preference, require_nvlink,
-                tags, metadata, state, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            job_id, request.job_name, request.user_id, request.priority,
-            request.requested_gpus, request.memory_per_gpu_mb,
-            request.expected_duration_minutes, request.scheduling_strategy.value,
-            request.gpu_type_preference, request.require_nvlink,
-            json.dumps(request.tags), json.dumps(request.metadata),
-            JobState.PENDING.value, now, now
-        ))
+    if events:
+        # Event summary
+        df_events = pd.DataFrame(events)
         
-        # Try to schedule immediately
-        assigned_gpus = scheduler.schedule_job(request)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Events", len(events))
+        with col2:
+            error_count = len(df_events[df_events['severity'] == 'error'])
+            st.metric("Errors", error_count)
+        with col3:
+            warning_count = len(df_events[df_events['severity'] == 'warning'])
+            st.metric("Warnings", warning_count)
         
-        if assigned_gpus:
-            # Update job state
-            conn.execute("""
-                UPDATE jobs 
-                SET state = ?, scheduled_at = ?, updated_at = ?
-                WHERE job_id = ?
-            """, (JobState.SCHEDULED.value, now, now, job_id))
+        # Event timeline
+        if len(df_events) > 0:
+            df_events['timestamp'] = pd.to_datetime(df_events['timestamp'])
+            events_by_hour = df_events.set_index('timestamp').resample('1H').size().reset_index()
+            events_by_hour.columns = ['hour', 'count']
             
-            # Create GPU assignments
-            for gpu_id in assigned_gpus:
-                conn.execute("""
-                    INSERT INTO job_assignments (job_id, gpu_id, assigned_at)
-                    VALUES (?, ?, ?)
-                """, (job_id, gpu_id, now))
+            fig_timeline = px.bar(
+                events_by_hour,
+                x='hour',
+                y='count',
+                title="Events Over Time",
+                labels={'count': 'Number of Events', 'hour': 'Hour'}
+            )
+            fig_timeline.update_layout(height=300)
+            st.plotly_chart(fig_timeline, use_container_width=True)
+        
+        # Event list
+        st.subheader("Event Log")
+        
+        for event in events[:100]:  # Show last 100 events
+            severity_colors = {
+                'info': '🔵',
+                'warning': '🟡', 
+                'error': '🔴'
+            }
+            
+            severity_icon = severity_colors.get(event['severity'], '⚪')
+            timestamp = datetime.fromisoformat(event['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+            
+            with st.container():
+                col1, col2 = st.columns([1, 4])
                 
-                # Update GPU state and allocated memory
-                conn.execute("""
-                    UPDATE gpus 
-                    SET state = 'busy', 
-                        memory_allocated_mb = memory_allocated_mb + ?
-                    WHERE gpu_id = ?
-                """, (request.memory_per_gpu_mb, gpu_id))
-            
-            conn.commit()
-            
-            await monitor._log_event(
-                "job_scheduled",
-                "info",
-                f"job_{job_id}",
-                f"Job {request.job_name} scheduled on GPUs {assigned_gpus}",
-                {"user_id": request.user_id, "gpus": assigned_gpus}
-            )
-            
-            return JobResponse(
-                job_id=job_id,
-                state=JobState.SCHEDULED,
-                assigned_gpus=assigned_gpus,
-                scheduled_at=now,
-                message=f"Job scheduled on GPUs: {assigned_gpus}"
-            )
-        else:
-            # Job queued
-            conn.commit()
-            
-            await monitor._log_event(
-                "job_queued",
-                "info",
-                f"job_{job_id}",
-                f"Job {request.job_name} queued - no resources available",
-                {"user_id": request.user_id}
-            )
-            
-            return JobResponse(
-                job_id=job_id,
-                state=JobState.PENDING,
-                assigned_gpus=[],
-                message="Job queued - waiting for resources"
-            )
+                with col1:
+                    st.write(f"{severity_icon} **{event['severity'].upper()}**")
+                    st.caption(timestamp)
+                
+                with col2:
+                    st.write(f"**{event['event_type']}** - {event['message']}")
+                    if event['source']:
+                        st.caption(f"Source: {event['source']}")
+                
+                st.divider()
+    
+    else:
+        st.info("No events found for the selected criteria.")
 
-@app.get("/jobs", tags=["Job Management"])
-async def list_jobs(
-    state: Optional[JobState] = None,
-    user_id: Optional[str] = None,
-    limit: int = Query(100, ge=1, le=1000)
-):
-    """List jobs with optional filtering"""
-    with db_manager.get_connection() as conn:
-        query = "SELECT * FROM jobs WHERE 1=1"
-        params = []
-        
-        if state:
-            query += " AND state = ?"
-            params.append(state.value)
-        
-        if user_id:
-            query += " AND user_id = ?"
-            params.append(user_id)
-        
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
-        
-        jobs = conn.execute(query, params).fetchall()
-        
-        results = []
-        for job in jobs:
-            job_dict = dict(job)
-            job_dict['tags'] = json.loads(job_dict.get('tags', '[]'))
-            job_dict['metadata'] = json.loads(job_dict.get('metadata', '{}'))
-            
-            # Get assigned GPUs
-            gpus = conn.execute("""
-                SELECT gpu_id FROM job_assignments
-                WHERE job_id = ? AND released_at IS NULL
-            """, (job['job_id'],)).fetchall()
-            
-            job_dict['assigned_gpus'] = [g['gpu_id'] for g in gpus]
-            results.append(job_dict)
-        
-        return {"jobs": results}
-
-@app.get("/jobs/{job_id}", tags=["Job Management"])
-async def get_job_status(job_id: str):
-    """Get detailed status for a specific job"""
-    with db_manager.get_connection() as conn:
-        job = conn.execute(
-            "SELECT * FROM jobs WHERE job_id = ?",
-            (job_id,)
-        ).fetchone()
-        
-        if not job:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Job {job_id} not found"
-            )
-        
-        job_dict = dict(job)
-        job_dict['tags'] = json.loads(job_dict.get('tags', '[]'))
-        job_dict['metadata'] = json.loads(job_dict.get('metadata', '{}'))
-        
-        # Get GPU assignments with details
-        assignments = conn.execute("""
-            SELECT ja.*, g.node_id, g.gpu_name, g.hostname
-            FROM job_assignments ja
-            JOIN gpus g ON ja.gpu_id = g.gpu_id
-            WHERE ja.job_id = ?
-        """, (job_id,)).fetchall()
-        
-        job_dict['gpu_assignments'] = [dict(a) for a in assignments]
-        
-        return job_dict
-
-@app.patch("/jobs/{job_id}/state", tags=["Job Management"])
-async def update_job_state(
-    job_id: str,
-    state: JobState,
-    error_message: Optional[str] = None
-):
-    """Update job state (for job completion, failure, etc.)"""
+def cancel_job(job_id: str):
+    """Cancel a job and release its resources"""
+    db = st.session_state.db_manager
     now = datetime.utcnow().isoformat()
     
-    with db_manager.get_connection() as conn:
-        # Get current job
+    with db.get_connection() as conn:
+        # Get job details
         job = conn.execute(
-            "SELECT state, memory_per_gpu_mb FROM jobs WHERE job_id = ?",
+            "SELECT memory_per_gpu_mb FROM jobs WHERE job_id = ?", 
             (job_id,)
         ).fetchone()
         
         if not job:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Job {job_id} not found"
-            )
+            st.error("Job not found")
+            return
         
         # Update job state
-        update_fields = ["state = ?", "updated_at = ?"]
-        update_values = [state.value, now]
+        conn.execute("""
+            UPDATE jobs 
+            SET state = 'cancelled', updated_at = ?
+            WHERE job_id = ?
+        """, (now, job_id))
         
-        if state == JobState.RUNNING:
+        # Release GPU assignments
+        gpu_assignments = conn.execute("""
+            SELECT gpu_id FROM job_assignments
+            WHERE job_id = ? AND released_at IS NULL
+        """, (job_id,)).fetchall()
+        
+        for assignment in gpu_assignments:
+            gpu_id = assignment['gpu_id']
+            
+            # Release assignment
+            conn.execute("""
+                UPDATE job_assignments 
+                SET released_at = ? 
+                WHERE job_id = ? AND gpu_id = ?
+            """, (now, job_id, gpu_id))
+            
+            # Update GPU state
+            conn.execute("""
+                UPDATE gpus 
+                SET state = 'available',
+                    memory_allocated_mb = memory_allocated_mb - ?
+                WHERE gpu_id = ?
+            """, (job['memory_per_gpu_mb'], gpu_id))
+        
+        conn.commit()
+        st.success(f"Job {job_id[:8]}... cancelled successfully")
+
+def update_job_state(job_id: str, new_state: str):
+    """Update job state"""
+    db = st.session_state.db_manager
+    now = datetime.utcnow().isoformat()
+    
+    with db.get_connection() as conn:
+        update_fields = ["state = ?", "updated_at = ?"]
+        update_values = [new_state, now]
+        
+        if new_state == JobState.RUNNING.value:
             update_fields.append("started_at = ?")
             update_values.append(now)
-        elif state in [JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED]:
-            update_fields.append(f"{'completed_at' if state == JobState.COMPLETED else 'failed_at'} = ?")
+        elif new_state == JobState.COMPLETED.value:
+            update_fields.append("completed_at = ?")
             update_values.append(now)
-            
-            if error_message and state == JobState.FAILED:
-                update_fields.append("error_message = ?")
-                update_values.append(error_message)
         
         update_values.append(job_id)
         conn.execute(
             f"UPDATE jobs SET {', '.join(update_fields)} WHERE job_id = ?",
             update_values
         )
-        
-        # Release GPUs if job is ending
-        if state in [JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED]:
-            # Get assigned GPUs
-            gpu_assignments = conn.execute("""
-                SELECT gpu_id FROM job_assignments
-                WHERE job_id = ? AND released_at IS NULL
-            """, (job_id,)).fetchall()
-            
-            for assignment in gpu_assignments:
-                gpu_id = assignment['gpu_id']
-                
-                # Release assignment
-                conn.execute("""
-                    UPDATE job_assignments 
-                    SET released_at = ? 
-                    WHERE job_id = ? AND gpu_id = ?
-                """, (now, job_id, gpu_id))
-                
-                # Update GPU state
-                conn.execute("""
-                    UPDATE gpus 
-                    SET state = 'available',
-                        memory_allocated_mb = memory_allocated_mb - ?,
-                        total_jobs_completed = total_jobs_completed + 1
-                    WHERE gpu_id = ?
-                """, (job['memory_per_gpu_mb'], gpu_id))
-        
         conn.commit()
         
-        await monitor._log_event(
-            f"job_{state.value.lower()}",
-            "info" if state != JobState.FAILED else "warning",
-            f"job_{job_id}",
-            f"Job {job_id} state changed to {state.value}",
-            {"error": error_message} if error_message else None
-        )
-        
-        return {"message": f"Job state updated to {state.value}"}
+        st.success(f"Job state updated to {new_state}")
 
-@app.delete("/jobs/{job_id}", tags=["Job Management"])
-async def cancel_job(job_id: str):
-    """Cancel a pending or running job"""
-    return await update_job_state(job_id, JobState.CANCELLED)
-
-# ==============================================================================
-# WebSocket Support
-# ==============================================================================
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket connection for real-time updates"""
-    await websocket.accept()
-    monitor.websocket_clients.add(websocket)
+def create_demo_gpus():
+    """Create demo GPUs for testing"""
+    db = st.session_state.db_manager
     
-    try:
-        # Send initial cluster state
-        metrics = monitor.get_cluster_metrics()
-        await websocket.send_json({
-            "type": "connection",
-            "data": {
-                "message": "Connected to GPU cluster control plane",
-                "metrics": metrics.dict()
-            }
-        })
-        
-        # Keep connection alive and handle messages
-        while True:
-            try:
-                # Wait for client messages (ping/pong or commands)
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
-                
-                try:
-                    message = json.loads(data)
-                    
-                    if message.get("type") == "ping":
-                        await websocket.send_json({"type": "pong"})
-                    elif message.get("type") == "subscribe":
-                        # Client can subscribe to specific events
-                        await websocket.send_json({
-                            "type": "subscribed",
-                            "data": {"message": "Subscription confirmed"}
-                        })
-                        
-                except json.JSONDecodeError:
-                    await websocket.send_json({
-                        "type": "error",
-                        "data": {"message": "Invalid JSON"}
-                    })
-                    
-            except asyncio.TimeoutError:
-                # Send periodic heartbeat
-                await websocket.send_json({"type": "heartbeat"})
-                
-    except WebSocketDisconnect:
-        monitor.websocket_clients.discard(websocket)
-        logger.info("WebSocket client disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        monitor.websocket_clients.discard(websocket)
-
-# ==============================================================================
-# Health and Debug Endpoints
-# ==============================================================================
-
-@app.get("/health", tags=["System"])
-async def health_check():
-    """Service health check"""
-    try:
-        with db_manager.get_connection() as conn:
-            # Check database connectivity
-            conn.execute("SELECT 1").fetchone()
-            
-        return {
-            "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "version": app.version
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-@app.get("/debug/scheduler", tags=["Debug"])
-async def debug_scheduler():
-    """Debug scheduler state"""
-    with db_manager.get_connection() as conn:
-        # Get pending jobs
-        pending_jobs = conn.execute("""
-            SELECT job_id, job_name, requested_gpus, memory_per_gpu_mb
-            FROM jobs
-            WHERE state = 'pending'
-            ORDER BY priority DESC, created_at
-        """).fetchall()
-        
-        # Get available GPU capacity
-        available_gpus = conn.execute("""
-            SELECT gpu_id, node_id, gpu_name, 
-                   memory_total_mb - memory_allocated_mb as free_memory_mb
-            FROM gpus
-            WHERE state = 'available'
-            ORDER BY free_memory_mb DESC
-        """).fetchall()
-        
-        return {
-            "pending_jobs": [dict(j) for j in pending_jobs],
-            "available_gpus": [dict(g) for g in available_gpus],
-            "scheduler_info": {
-                "strategies": [s.value for s in SchedulingStrategy],
-                "heartbeat_timeout": HEARTBEAT_TIMEOUT_SECONDS
-            }
-        }
-
-# ==============================================================================
-# Demo/Test Endpoints
-# ==============================================================================
-
-@app.post("/demo/populate", tags=["Demo"])
-async def populate_demo_data():
-    """Populate cluster with demo GPUs for testing"""
     demo_gpus = [
         {
             "node_id": f"demo-node-{i:02d}",
@@ -1378,242 +1090,163 @@ async def populate_demo_data():
             "memory_total_mb": random.choice([24576, 16384, 40960, 80896]),
             "driver_version": "535.129.03",
             "location": f"rack-{i//4 + 1}",
-            "tags": ["demo", f"zone-{(i % 3) + 1}"]
+            "tags": json.dumps(["demo", f"zone-{(i % 3) + 1}"])
         }
         for i in range(8)
     ]
     
-    created = []
-    for gpu_data in demo_gpus:
-        request = RegisterGPURequest(**gpu_data)
-        try:
-            result = await register_gpu(request)
-            created.append(result)
-        except HTTPException:
-            pass  # Skip if already exists
-    
-    return {
-        "message": f"Created {len(created)} demo GPUs",
-        "gpus": created
-    }
-
-# ==============================================================================
-# HTML Dashboard
-# ==============================================================================
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard():
-    """Simple web dashboard"""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>GPU Cluster Control Plane</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
-            .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-            h1 { color: #333; }
-            .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
-            .metric-card { background: #f8f9fa; padding: 15px; border-radius: 5px; border: 1px solid #dee2e6; }
-            .metric-value { font-size: 24px; font-weight: bold; color: #007bff; }
-            .metric-label { color: #6c757d; font-size: 14px; }
-            .status { margin: 20px 0; }
-            .gpu-list { margin-top: 20px; }
-            .gpu-item { background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; }
-            .gpu-available { border-left: 4px solid #28a745; }
-            .gpu-busy { border-left: 4px solid #ffc107; }
-            .gpu-offline { border-left: 4px solid #dc3545; }
-            .actions { margin: 20px 0; }
-            button { background: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px; }
-            button:hover { background: #0056b3; }
-            #log { background: #f8f9fa; padding: 10px; border-radius: 5px; height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>GPU Cluster Control Plane</h1>
-            
-            <div class="metrics" id="metrics">
-                <div class="metric-card">
-                    <div class="metric-label">Total GPUs</div>
-                    <div class="metric-value" id="total-gpus">-</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Available GPUs</div>
-                    <div class="metric-value" id="available-gpus">-</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Active Jobs</div>
-                    <div class="metric-value" id="active-jobs">-</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">Average Utilization</div>
-                    <div class="metric-value" id="avg-util">-</div>
-                </div>
-            </div>
-            
-            <div class="actions">
-                <button onclick="refreshStatus()">Refresh</button>
-                <button onclick="populateDemo()">Populate Demo GPUs</button>
-                <button onclick="clearLog()">Clear Log</button>
-            </div>
-            
-            <div class="status">
-                <h2>GPU Status</h2>
-                <div class="gpu-list" id="gpu-list">
-                    Loading...
-                </div>
-            </div>
-            
-            <div class="status">
-                <h2>Real-time Log</h2>
-                <div id="log"></div>
-            </div>
-        </div>
+    with db.get_connection() as conn:
+        now = datetime.utcnow().isoformat()
         
-        <script>
-            let ws = null;
-            
-            function connectWebSocket() {
-                ws = new WebSocket('ws://localhost:8000/ws');
+        for gpu_data in demo_gpus:
+            try:
+                # Simulate some metrics
+                gpu_data.update({
+                    'utilization_percent': random.uniform(0, 100),
+                    'temperature_celsius': random.uniform(30, 80),
+                    'power_watts': random.uniform(50, 300),
+                    'registered_at': now,
+                    'last_heartbeat': now
+                })
                 
-                ws.onopen = () => {
-                    log('Connected to control plane');
-                };
-                
-                ws.onmessage = (event) => {
-                    const message = JSON.parse(event.data);
-                    
-                    if (message.type === 'metrics_update') {
-                        updateMetrics(message.data);
-                    }
-                    
-                    if (message.type !== 'heartbeat') {
-                        log(`[${new Date().toLocaleTimeString()}] ${message.type}: ${JSON.stringify(message.data)}`);
-                    }
-                };
-                
-                ws.onclose = () => {
-                    log('Disconnected from control plane');
-                    setTimeout(connectWebSocket, 5000);
-                };
-                
-                ws.onerror = (error) => {
-                    log('WebSocket error: ' + error);
-                };
-            }
-            
-            function updateMetrics(metrics) {
-                document.getElementById('total-gpus').textContent = metrics.total_gpus;
-                document.getElementById('available-gpus').textContent = metrics.available_gpus;
-                document.getElementById('active-jobs').textContent = metrics.active_jobs;
-                document.getElementById('avg-util').textContent = metrics.average_utilization.toFixed(1) + '%';
-            }
-            
-            async function refreshStatus() {
-                try {
-                    const response = await fetch('/status?format=detailed&include_metrics=true');
-                    const data = await response.json();
-                    
-                    // Update metrics
-                    if (data.cluster_metrics) {
-                        updateMetrics(data.cluster_metrics);
-                    }
-                    
-                    // Update GPU list
-                    const gpuList = document.getElementById('gpu-list');
-                    gpuList.innerHTML = '';
-                    
-                    data.gpus.forEach(gpu => {
-                        const item = document.createElement('div');
-                        item.className = `gpu-item gpu-${gpu.state}`;
-                        
-                        const memUsed = gpu.memory_allocated_mb || 0;
-                        const memTotal = gpu.memory_total_mb || 1;
-                        const memPercent = ((memUsed / memTotal) * 100).toFixed(1);
-                        
-                        item.innerHTML = `
-                            <div>
-                                <strong>GPU ${gpu.gpu_id}</strong> - ${gpu.gpu_name} (${gpu.node_id})
-                                <br>
-                                <small>${gpu.state.toUpperCase()} | ${gpu.utilization_percent.toFixed(0)}% util | ${gpu.temperature_celsius.toFixed(0)}°C | Memory: ${memUsed}/${memTotal} MB (${memPercent}%)</small>
-                            </div>
-                            <div>
-                                ${gpu.active_jobs.length > 0 ? `Jobs: ${gpu.active_jobs.length}` : ''}
-                            </div>
-                        `;
-                        
-                        gpuList.appendChild(item);
-                    });
-                    
-                    log('Status refreshed');
-                } catch (error) {
-                    log('Error refreshing status: ' + error);
-                }
-            }
-            
-            async function populateDemo() {
-                try {
-                    const response = await fetch('/demo/populate', { method: 'POST' });
-                    const data = await response.json();
-                    log(data.message);
-                    setTimeout(refreshStatus, 1000);
-                } catch (error) {
-                    log('Error populating demo data: ' + error);
-                }
-            }
-            
-            function log(message) {
-                const logDiv = document.getElementById('log');
-                const entry = document.createElement('div');
-                entry.textContent = message;
-                logDiv.appendChild(entry);
-                logDiv.scrollTop = logDiv.scrollHeight;
-                
-                // Keep only last 100 messages
-                while (logDiv.children.length > 100) {
-                    logDiv.removeChild(logDiv.firstChild);
-                }
-            }
-            
-            function clearLog() {
-                document.getElementById('log').innerHTML = '';
-            }
-            
-            // Initialize
-            connectWebSocket();
-            refreshStatus();
-            
-            // Auto-refresh every 5 seconds
-            setInterval(refreshStatus, 5000);
-        </script>
-    </body>
-    </html>
-    """
+                conn.execute("""
+                    INSERT OR IGNORE INTO gpus (
+                        node_id, hostname, gpu_name, memory_total_mb, 
+                        driver_version, location, tags,
+                        utilization_percent, temperature_celsius, power_watts,
+                        registered_at, last_heartbeat
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    gpu_data['node_id'], gpu_data['hostname'], gpu_data['gpu_name'],
+                    gpu_data['memory_total_mb'], gpu_data['driver_version'], 
+                    gpu_data['location'], gpu_data['tags'],
+                    gpu_data['utilization_percent'], gpu_data['temperature_celsius'],
+                    gpu_data['power_watts'], gpu_data['registered_at'], gpu_data['last_heartbeat']
+                ))
+            except Exception as e:
+                continue  # Skip if already exists
+        
+        conn.commit()
+    
+    st.success("Demo GPUs created successfully!")
 
-# ==============================================================================
-# Main Entry Point
-# ==============================================================================
+def create_demo_metrics():
+    """Create demo metrics history for charts"""
+    db = st.session_state.db_manager
+    
+    with db.get_connection() as conn:
+        # Get all GPU IDs
+        gpus = conn.execute("SELECT gpu_id FROM gpus").fetchall()
+        
+        if not gpus:
+            return
+        
+        # Generate metrics for last 24 hours
+        now = datetime.utcnow()
+        
+        for hours_back in range(24):
+            timestamp = (now - timedelta(hours=hours_back)).isoformat()
+            
+            for gpu in gpus:
+                gpu_id = gpu['gpu_id']
+                
+                # Generate realistic-looking metrics
+                base_util = random.uniform(20, 80)
+                util_variation = random.uniform(-10, 10)
+                utilization = max(0, min(100, base_util + util_variation))
+                
+                temperature = random.uniform(45, 75)
+                power = random.uniform(100, 250)
+                memory_used = random.randint(2000, 20000)
+                
+                conn.execute("""
+                    INSERT OR IGNORE INTO gpu_metrics_history 
+                    (gpu_id, timestamp, temperature_celsius, utilization_percent, 
+                     memory_used_mb, power_watts)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (gpu_id, timestamp, temperature, utilization, memory_used, power))
+        
+        conn.commit()
+
+def main():
+    """Main Streamlit application"""
+    st.set_page_config(
+        page_title="GPU Cluster Control Plane",
+        page_icon="🖥️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Initialize
+    init_session_state()
+    
+    # Header
+    st.title("🖥️ GPU Cluster Control Plane")
+    st.markdown("---")
+    
+    # Sidebar navigation
+    with st.sidebar:
+        st.header("Navigation")
+        
+        tab_selection = st.radio(
+            "Select View",
+            options=["Overview", "GPU Management", "Job Management", "Monitoring", "Events & Logs"],
+            index=0
+        )
+        
+        st.markdown("---")
+        
+        # Quick actions
+        st.header("Quick Actions")
+        
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            st.rerun()
+        
+        if st.button("📊 Generate Demo Metrics", use_container_width=True):
+            create_demo_metrics()
+            st.success("Demo metrics generated!")
+            st.rerun()
+        
+        if st.button("🧹 Clear All Data", use_container_width=True, type="secondary"):
+            if st.session_state.get('confirm_clear'):
+                # Clear database
+                db = st.session_state.db_manager
+                with db.get_connection() as conn:
+                    conn.execute("DELETE FROM job_assignments")
+                    conn.execute("DELETE FROM jobs")
+                    conn.execute("DELETE FROM gpu_metrics_history")
+                    conn.execute("DELETE FROM cluster_events")
+                    conn.execute("DELETE FROM gpus")
+                    conn.commit()
+                st.success("All data cleared!")
+                st.session_state.confirm_clear = False
+                st.rerun()
+            else:
+                st.session_state.confirm_clear = True
+                st.warning("Click again to confirm deletion")
+        
+        # System info
+        st.markdown("---")
+        st.header("System Info")
+        
+        metrics = get_cluster_metrics()
+        st.metric("Database", DB_FILE)
+        st.metric("Total GPUs", metrics['total_gpus'])
+        st.metric("Active Jobs", metrics['active_jobs'])
+        
+        st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Main content based on tab selection
+    if tab_selection == "Overview":
+        render_overview_tab()
+    elif tab_selection == "GPU Management":
+        render_gpus_tab()
+    elif tab_selection == "Job Management":
+        render_jobs_tab()
+    elif tab_selection == "Monitoring":
+        render_monitoring_tab()
+    elif tab_selection == "Events & Logs":
+        render_events_tab()
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="GPU Cluster Control Plane")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
-    parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
-    
-    args = parser.parse_args()
-    
-    # Configure logging
-    logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
-    
-    # Run server
-    uvicorn.run(
-        "control_plane:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        log_level=args.log_level
-    )
+    main()
