@@ -1,4 +1,9 @@
-streamlit
-pandas
-plotly
+streamlit>=1.28.0
+pandas>=1.5.0
+plotly>=5.15.0
+aiohttp>=3.8.0
 sqlite3
+uuid
+asyncio
+threading
+queue
